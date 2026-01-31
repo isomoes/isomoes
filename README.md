@@ -1,9 +1,9 @@
-## 👋 Coding Journey (Isomo) 
+## 👋 Coding Journey (Isomoes) 
 
-![](https://raw.githubusercontent.com/jiahaoxiang2000/jiahaoxiang2000/master/generated/overview.svg#gh-dark-mode-only)
-![](https://raw.githubusercontent.com/jiahaoxiang2000/jiahaoxiang2000/master/generated/overview.svg#gh-light-mode-only)
-![](https://raw.githubusercontent.com/jiahaoxiang2000/jiahaoxiang2000/master/generated/languages.svg#gh-dark-mode-only)
-![](https://raw.githubusercontent.com/jiahaoxiang2000/jiahaoxiang2000/master/generated/languages.svg#gh-light-mode-only)
+![](https://raw.githubusercontent.com/isomoes/isomoes/master/generated/overview.svg#gh-dark-mode-only)
+![](https://raw.githubusercontent.com/isomoes/isomoes/master/generated/overview.svg#gh-light-mode-only)
+![](https://raw.githubusercontent.com/isomoes/isomoes/master/generated/languages.svg#gh-dark-mode-only)
+![](https://raw.githubusercontent.com/isomoes/isomoes/master/generated/languages.svg#gh-light-mode-only)
 
 <!--
 **jiahaoxiang2000/jiahaoxiang2000** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
