@@ -25,11 +25,15 @@ class Queries(object):
         access_token: str,
         session: aiohttp.ClientSession,
         max_connections: int = 10,
+        rest_max_retries: int = 10,
+        rest_retry_delay: float = 2.0,
     ):
         self.username = username
         self.access_token = access_token
         self.session = session
         self.semaphore = asyncio.Semaphore(max_connections)
+        self.rest_max_retries = rest_max_retries
+        self.rest_retry_delay = rest_retry_delay
 
     async def query(self, generated_query: str) -> Dict:
         """
@@ -73,25 +77,21 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
+        for _ in range(self.rest_max_retries):
             headers = {
                 "Authorization": f"token {self.access_token}",
             }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
+            query_params = dict() if params is None else params
+            path_to_query = path[1:] if path.startswith("/") else path
             try:
                 async with self.semaphore:
                     r_async = await self.session.get(
-                        f"https://api.github.com/{path}",
+                        f"https://api.github.com/{path_to_query}",
                         headers=headers,
-                        params=tuple(params.items()),
+                        params=tuple(query_params.items()),
                     )
                 if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(self.rest_retry_delay)
                     continue
 
                 result = await r_async.json()
@@ -102,13 +102,12 @@ class Queries(object):
                 # Fall back on non-async requests
                 async with self.semaphore:
                     r_requests = requests.get(
-                        f"https://api.github.com/{path}",
+                        f"https://api.github.com/{path_to_query}",
                         headers=headers,
-                        params=tuple(params.items()),
+                        params=tuple(query_params.items()),
                     )
                     if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(self.rest_retry_delay)
                         continue
                     elif r_requests.status_code == 200:
                         return r_requests.json()
@@ -134,7 +133,7 @@ class Queries(object):
             direction: DESC
         }},
         isFork: false,
-        after: {"null" if owned_cursor is None else '"'+ owned_cursor +'"'}
+        after: {"null" if owned_cursor is None else '"' + owned_cursor + '"'}
     ) {{
       pageInfo {{
         hasNextPage
@@ -170,7 +169,7 @@ class Queries(object):
             REPOSITORY,
             PULL_REQUEST_REVIEW
         ]
-        after: {"null" if contrib_cursor is None else '"'+ contrib_cursor +'"'}
+        after: {"null" if contrib_cursor is None else '"' + contrib_cursor + '"'}
     ) {{
       pageInfo {{
         hasNextPage
@@ -483,8 +482,14 @@ Languages:
             return self._lines_changed
         additions = 0
         deletions = 0
-        for repo in await self.repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
+        repos = list(await self.repos)
+        contributor_stats = await asyncio.gather(
+            *[
+                self.queries.query_rest(f"/repos/{repo}/stats/contributors")
+                for repo in repos
+            ]
+        )
+        for r in contributor_stats:
             for author_obj in r:
                 # Handle malformed response from the API by skipping this repo
                 if not isinstance(author_obj, dict) or not isinstance(
@@ -512,8 +517,11 @@ Languages:
             return self._views
 
         total = 0
-        for repo in await self.repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
+        repos = list(await self.repos)
+        views_by_repo = await asyncio.gather(
+            *[self.queries.query_rest(f"/repos/{repo}/traffic/views") for repo in repos]
+        )
+        for r in views_by_repo:
             for view in r.get("views", []):
                 total += view.get("count", 0)
 
