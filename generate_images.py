@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+from datetime import datetime
 
 import aiohttp
 
@@ -41,6 +42,7 @@ async def generate_overview(s: Stats) -> None:
     output = re.sub("{{ contributions }}", f"{await s.total_contributions:,}", output)
     output = re.sub("{{ views }}", f"{await s.views:,}", output)
     output = re.sub("{{ repos }}", f"{len(await s.repos):,}", output)
+    output = re.sub("{{ created }}", datetime.now().strftime("%Y%m%d"), output)
 
     generate_output_folder()
     with open("generated/overview.svg", "w") as f:
