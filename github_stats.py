@@ -1,11 +1,42 @@
 #!/usr/bin/python3
 
 import asyncio
+import json
 import os
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
 import requests
+
+
+GRAPHQL_URL = "https://api.github.com/graphql"
+
+# Statuses that mean "try again", not "your query was wrong". GitHub's gateway
+# serves these with an HTML body, so they must be caught before anything tries
+# to decode the response as JSON.
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Back off exponentially, but never wait longer than this between attempts.
+MAX_RETRY_DELAY = 60.0
+
+
+class GitHubApiError(RuntimeError):
+    """
+    Raised when the GitHub API could not be queried successfully. Raising beats
+    returning an empty result: callers would otherwise treat "no data" as "no
+    repositories" and generate a badge full of zeroes.
+    """
+
+
+def summarize_body(body: str, limit: int = 120) -> str:
+    """
+    Collapse a response body into a single short line suitable for logging
+    :param body: raw response body
+    :param limit: maximum number of characters to keep
+    :return: whitespace-collapsed, truncated body
+    """
+    collapsed = " ".join(body.split())
+    return collapsed[:limit] + ("..." if len(collapsed) > limit else "")
 
 
 ###############################################################################
@@ -27,6 +58,8 @@ class Queries(object):
         max_connections: int = 10,
         rest_max_retries: int = 10,
         rest_retry_delay: float = 2.0,
+        graphql_max_retries: int = 8,
+        graphql_retry_delay: float = 2.0,
     ):
         self.username = username
         self.access_token = access_token
@@ -34,6 +67,36 @@ class Queries(object):
         self.semaphore = asyncio.Semaphore(max_connections)
         self.rest_max_retries = rest_max_retries
         self.rest_retry_delay = rest_retry_delay
+        self.graphql_max_retries = graphql_max_retries
+        self.graphql_retry_delay = graphql_retry_delay
+
+    async def post_graphql(self, headers: Dict, payload: Dict) -> Tuple[int, str]:
+        """
+        POST to the GraphQL endpoint, returning the response undecoded so that
+        the caller can inspect the status before trying to parse the body
+        :param headers: request headers, including authorization
+        :param payload: JSON body to send
+        :return: tuple of HTTP status and raw response body
+        """
+        try:
+            async with self.semaphore:
+                r_async = await self.session.post(
+                    GRAPHQL_URL,
+                    headers=headers,
+                    json=payload,
+                )
+                return r_async.status, await r_async.text()
+        except Exception as error:
+            print(f"aiohttp failed for GraphQL query: {type(error).__name__}: {error}")
+
+        # Fall back on non-async requests
+        async with self.semaphore:
+            r_requests = requests.post(
+                GRAPHQL_URL,
+                headers=headers,
+                json=payload,
+            )
+            return r_requests.status_code, r_requests.text
 
     async def query(self, generated_query: str) -> Dict:
         """
@@ -45,29 +108,69 @@ class Queries(object):
         headers = {
             "Authorization": f"Bearer {self.access_token}",
         }
-        try:
-            async with self.semaphore:
-                r_async = await self.session.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query},
+        payload = {"query": generated_query}
+        failures: List[str] = []
+
+        for attempt in range(self.graphql_max_retries):
+            if attempt:
+                delay = min(
+                    self.graphql_retry_delay * 2 ** (attempt - 1), MAX_RETRY_DELAY
                 )
-            result = await r_async.json()
-            if result is not None:
+                print(
+                    f"Retrying GraphQL query in {delay:.0f}s "
+                    f"({attempt + 1}/{self.graphql_max_retries}) after {failures[-1]}"
+                )
+                await asyncio.sleep(delay)
+
+            try:
+                status, body = await self.post_graphql(headers, payload)
+            except Exception as error:
+                failures.append(f"{type(error).__name__}: {error}")
+                continue
+
+            if status == 401:
+                raise GitHubApiError(
+                    "GitHub rejected the access token (HTTP 401). Check that the "
+                    f"ACCESS_TOKEN secret is set and has not expired. "
+                    f"Response: {summarize_body(body)}"
+                )
+
+            if status in RETRYABLE_STATUSES:
+                failures.append(f"HTTP {status}: {summarize_body(body)}")
+                continue
+
+            try:
+                result = json.loads(body)
+            except ValueError:
+                # A body that is not JSON never came from the GraphQL service
+                # itself, only from something in front of it, so retrying is
+                # worthwhile rather than fatal.
+                failures.append(
+                    f"HTTP {status}, non-JSON body: {summarize_body(body)}"
+                )
+                continue
+
+            if isinstance(result, dict) and result.get("data") is not None:
                 return result
-        except:
-            print("aiohttp failed for GraphQL query")
-            # Fall back on non-async requests
-            async with self.semaphore:
-                r_requests = requests.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query},
+
+            if status == 200 and isinstance(result, dict) and result.get("errors"):
+                # The query itself was rejected; no amount of retrying fixes it.
+                raise GitHubApiError(
+                    f"GitHub rejected the GraphQL query: "
+                    f"{summarize_body(json.dumps(result['errors']))}"
                 )
-                result = r_requests.json()
-                if result is not None:
-                    return result
-        return dict()
+
+            # Covers secondary rate limits and other error payloads, which are
+            # valid JSON but carry no data.
+            failures.append(f"HTTP {status}, no data: {summarize_body(body)}")
+
+        attempted = "\n  ".join(
+            f"attempt {i}: {failure}" for i, failure in enumerate(failures, start=1)
+        )
+        raise GitHubApiError(
+            f"GraphQL query failed after {self.graphql_max_retries} attempts:\n"
+            f"  {attempted}"
+        )
 
     async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
         """
@@ -97,8 +200,10 @@ class Queries(object):
                 result = await r_async.json()
                 if result is not None:
                     return result
-            except:
-                print("aiohttp failed for rest query")
+            except Exception as error:
+                print(
+                    f"aiohttp failed for rest query: {type(error).__name__}: {error}"
+                )
                 # Fall back on non-async requests
                 async with self.semaphore:
                     r_requests = requests.get(
